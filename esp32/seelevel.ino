@@ -1,0 +1,300 @@
+#include <dummy.h>
+
+/* ESP32 Test/Demo app: Read Garnet SeeLevel Tank Sensor/Sender
+
+Updates by alex@phred.org:
+* Intended use, connected to a Victron Cerbo GX over USB
+  * Cerbo provides power
+  * ESP32 sends raw data from sensor over to Cerbo for processing
+* Simplified output meant for easy parsing rather than human consumption
+
+
+Inspired by Jim G.: https://forums.raspberrypi.com/viewtopic.php?t=119614
+
+To read RV tanks equipped with the Garnet SeeLevel sensors, one can purchase
+a display monitor panel that has any of Bluetooth, RV-C, or NEMA2000 - all of
+which would be a better interface than this. This is an attempt to read the
+sensors (senders) directly, without a Garnet display panel.
+
+Summary of information discovered by Jim G. and documented in the above post:
+
+  To trigger the tank sender/sensor, one needs to power the sender with 12V then
+  pull the 12V line to ground in a particular pattern. The sender will respond
+  by pulling the 12V line to ground with a series of pulses that can be
+  interpreted as bytes.
+
+  Triggering the sender:
+
+  Each Garnet SeeLevel tank sender is configured as sensor 1, 2, or 3 by snipping
+  a tab on the sender. A sender will respond when it sees a sequence of pulses
+  to ground equal to its sensor number. Each pulse needs to be approx 85µs wide.
+  Pulse spacing needs to be approximately 300µs.
+
+  The sender will respond by pulling the 12V line to ground in a series of pulses.
+  Pulses will either be approximately 13µs wide or 48µs wide. In this application
+  I'm treating the short pulses as '0', long pulses as '1'.
+
+  Bytes returned from sender:
+
+    0:      Unknown
+    1:      Checksum
+    2 - 10: Fill level from each segment of sender (0 - -255)
+    11:     Appears to be 255 in all cases
+
+  For the segment fill values, a 'full' value will likely be less than 255, apparently
+  depending on tank wall thickness, tank size, and perhaps how well the sender is
+  attached. In my testing, using a 710AR Rev E taped to a water jug, I see 'full' segments
+  anywhere from 126 to 200. Pressing on a segment with my thumb will cause the sensor
+  to read a higher value. Capacitance, perhaps?
+
+Demo app - Output to Serial port:
+
+    Tank 0: 147 121 0 0 0 0 14 108 149 179 184 255 Checksum: 121 OK
+
+Interfacing 12V sensor with 3.3V ESP32:
+
+To interface, I wired a circuit using this document as a guide:
+
+  https://forums.raspberrypi.com/viewtopic.php?t=119614
+
+  Jim D.'s circuit appears to work fine. For an ESP32, the voltage divider
+  on the read pin should be modified to limit pin to no more than 3.3V
+
+Notes:
+
+  This app doesn't attempt to accommodate a trimmed sender or any sender other than the
+  710AR Rev E.
+
+  No attempt is made to process the returned data into an actual liquid level. I'm intending
+  that to be done in some other app (perhaps Node-Red).
+
+  Uses Arduino framework but is only tested on an ESP32.
+
+*/
+
+#include <Arduino.h>
+#include <USB.h>
+#include <HardwareSerial.h>
+#include <WiFi.h>
+#include <MQTTClient.h>
+#include <string.h>
+
+// ESP32 Write Pin. Set HIGH to power sensors, pulsed to initiate sensor read
+const int SeeLevelWritePIN = 1;     // TX on circuit
+// ESP32 Read pin. Will be pulled low by sensors
+const int SeeLevelReadPIN = 2;      // RX on circuit
+// the user LED on the ESP32-S3
+const int UserLed = 21;
+
+// How often do we poll attached devices, in ms
+const int PollingInterval = 1000;
+// How many devices could be on the SeeLevel bus
+const int MaxDeviceAddress = 1;
+
+// Wifi and MQTT configuration
+const char WifiSsid[] = "House of Dijon";
+const char WifiPassword[] = "parkerjames2017";
+const char MqttServer[] = "venus.local";
+const int MqttPort = 1883;
+const char MqttUsername[] = "";
+const char MqttPassword[] = "";
+const char MqttPublishTopic[] = "/water/raw_sensor_data";
+
+// Which Serial to use for debug output
+//#define _SerialOut USBSerial
+#undef SERIAL_CDC
+#ifdef SERIAL_CDC
+#define _SerialOut Serial2
+// Serial pins
+const int SimRxdPin = 17;
+const int SimTxdPin = 18;
+#else
+#define _SerialOut Serial
+#endif
+
+// Time 12V bus is powered before sending pulse(s) to sensor(s)
+#define SEELEVEL_POWERON_DELAY_MICROSECONDS 2450
+// Width of pulse sent to sensors
+#define SEELEVEL_PULSE_LOW_MICROSECONDS 85
+// Time between pulses sent to sensors
+#define SEELEVEL_PULSE_HIGH_MICROSECONDS 290
+// How long to wait for response before timing out
+#define SEELEVEL_PULSE_TIMEOUT_MICROSECONDS 3000
+
+// Byte array to store data for 3 tanks x 12 bytes data per tank:
+byte SeeLevelData[3][12];
+
+byte readByte();
+void readLevel(int);
+
+void setup_wifi()
+{
+  WiFi.mode(WIFI_STA);
+  WiFi.begin("House of Dijon", "parkerjames2017");
+  _Serial.print("Connecting to wifi");
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    _Serial.print(".");
+    delay(1000);
+  }
+  _Serial.print("\nWiFi connected, IP address: ");
+  _Serial.println(WiFi.localIP());
+}
+
+MQTTClient mqtt = MQTTClient(256);
+
+void setup_mqtt()
+{
+  _Serial.println("Connecting to MQTT");
+  mqtt.connect(MqttServer, MqttUsername, MqttPassword);
+  _Serial.println("Connected!");
+}
+
+void setup() {
+#ifdef SERIAL_CDC
+  //_SerialOut.begin(115200, SERIAL_8N1, SimRxdPin, SimTxdPin);
+  _SerialOut.begin(115200);
+#else
+  _SerialOut.begin(115200);
+#endif
+  _SerialOut.println("\n\nTank Level is Woke!");
+  pinMode(SeeLevelWritePIN, OUTPUT);
+  pinMode(SeeLevelReadPIN, INPUT_PULLUP);
+  pinMode(UserLed, OUTPUT);
+  digitalWrite(SeeLevelWritePIN, LOW);
+  delay(5000);
+  setup_wifi();
+}
+
+void loop() {
+  String sensorOutput;
+  sensorOutput.concat("Tank " + (String)t + ": ");
+  for (auto t = 0; t < MaxDeviceAddress; t++) {
+    if (t != 0) {
+      // Bus must be pulled low for some time before attempting to read another sensor
+      delay(1000);
+    }
+
+    _SerialOut.print("Tank " + (String)t + ": ");
+    readLevel(t);
+
+    for (auto i = 0; i < 12; i++) {
+      sensorOutput.concat(SeeLevelData[t][i]);
+      sensorOutput.concat(',');
+    }
+
+    // Verify checksum
+    int byteSum = 0;
+    for (auto i = 2; i <= 10; i++) {  // Sum data bytes
+      byteSum = byteSum + SeeLevelData[t][i];
+    }
+    if (byteSum != 0) {
+      // Calculate and compare checksum
+      int checkSum = SeeLevelData[t][1];
+      // Checksum appears to be (sum of bytes % 256) - 1, with special case for checksum 255.
+      if (((byteSum % 256) - 1 == checkSum) || (byteSum % 256 == 0 && checkSum == 255)) {
+        //_SerialOut.print("Checksum: ");
+        //_SerialOut.print((byteSum % 256) - 1);
+        sensorOutput.concat("OK\n");
+      } else {
+        //_SerialOut.print(" byteSum % 256 - 1 = ");
+        //_SerialOut.print(" Checksum: ");
+        //_SerialOut.print((byteSum % 256) - 1);
+        sensorOutput.concat("BAD\n");
+      }
+    } else {
+      sensorOutput.concat("DISCONNECTED\n");
+      //_SerialOut.println(" byteSum == 0, No data ");
+    }
+
+    _SerialOut.print(sensorOutput);
+
+    // Clear the sensor data array
+    for (auto t = 0; t < 3; t++) {
+      for (auto i = 0; i < 12; i++) {
+        SeeLevelData[t][i] = 0;
+      }
+    }
+  }
+
+  delay(PollingInterval);  // wait between reads
+}
+
+//
+// Read an individual tank level
+// Pass parameter 't', where
+//    t = 0 SeeLevel tank 1 (Normally Fresh Tank)
+//    t = 1 SeeLevel tank 2 (Normally Grey Tank)
+//    t = 2 SeeLevel tank 3 (Normally Black Tank)
+//
+// Passed variable (t) is 0, 1 or 2
+//
+void readLevel(int t) {
+  // Power the sensor line for 2.4 ms so tank levels can be read
+  digitalWrite(SeeLevelWritePIN, HIGH);
+  delayMicroseconds(SEELEVEL_POWERON_DELAY_MICROSECONDS);
+
+  digitalWrite(UserLed, LOW);
+
+  // 1, 2 or 3 low pulses to select Fresh, Grey, Black tank
+  for (int i = 0; i <= t; i++) {
+    digitalWrite(SeeLevelWritePIN, LOW);
+    delayMicroseconds(SEELEVEL_PULSE_LOW_MICROSECONDS);
+    digitalWrite(SeeLevelWritePIN, HIGH);
+    delayMicroseconds(SEELEVEL_PULSE_HIGH_MICROSECONDS);
+  }
+
+  // Sensor should respond in approx 7ms. Do nothing for 5ms.
+  delay(5);
+
+  // Read 12 bytes from sensor, store in array
+  // Disable interrupts during sensor read.
+  // Should take approx 13.5ms. for normal sensor read.
+  // Note that this may not be reliable in all cases.
+  portDISABLE_INTERRUPTS();
+  for (auto byteLoop = 0; byteLoop < 12; byteLoop++) {
+    SeeLevelData[t][byteLoop] = readByte();
+  }
+  portENABLE_INTERRUPTS();
+  delay(1);
+  digitalWrite(SeeLevelWritePIN, LOW);  // Turn power off until next poll
+  digitalWrite(UserLed, HIGH);
+}
+
+//
+// Read individual bytes from SeeLevel sensor
+//
+// Sensor pulses are interpreted as approx:
+//       48 microseconds for digital '1',
+//       13 microseconds for digital '0'
+//
+// Each byte will roughly approximate the fill level of a segment of the sensor 0 <> 255
+//
+// A 'full' sensor segment will show somewhere between 126 and 255, depending on tank wall
+// thickness, other factors.
+//
+// Testing can be done by temporarily attaching sensor to water jug or by simply touching
+// sensor segments.
+//
+byte readByte() {
+  int result = 0;
+  int thisBit = 0;
+  for (auto bitLoop = 0; bitLoop < 8; bitLoop++) {  // Populate byte from right to left,
+    result = result << 1;                           // Shift right for each incoming bit
+
+    // Wait for low pulse, timeout if no pulse (I.E. no tank present)
+    unsigned long pulseTime = (pulseIn(SeeLevelReadPIN, HIGH, SEELEVEL_PULSE_TIMEOUT_MICROSECONDS));
+
+    // Decide if pulse is logical '0', '1' or invalid
+    if ((pulseTime >= 5) && (pulseTime <= 20)) {
+      thisBit = 0;
+    } else if ((pulseTime >= 30) && (pulseTime <= 60)) {
+      thisBit = 1;
+    } else {
+      return 0;  // Pulse width out of range, Return zero
+    }
+    // Bitwise OR and shift pulses into single byte
+    result |= thisBit;
+  }
+  return result;
+}
